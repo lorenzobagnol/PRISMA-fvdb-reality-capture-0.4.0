@@ -15,7 +15,8 @@ def mesh_from_splats_dlnr(
     camera_to_world_matrices: NumericMaxRank3,
     projection_matrices: NumericMaxRank3,
     image_sizes: NumericMaxRank2,
-    truncation_margin: float,
+    masks: torch.Tensor | None = None,
+    truncation_margin: float =0.2,
     grid_shell_thickness: float = 3.0,
     baseline: float = 0.07,
     near: float = 4.0,
@@ -29,7 +30,7 @@ def mesh_from_splats_dlnr(
     use_absolute_baseline: bool = False,
     show_progress: bool = True,
     num_workers: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,]:
     """
     Extract a triangle mesh from a :class:`fvdb.GaussianSplat3d` using TSDF fusion from depth maps predicted from the Gaussian splat radiance field and the
     `DLNR foundation model <https://openaccess.thecvf.com/content/CVPR2023/papers/Zhao_High-Frequency_Stereo_Matching_Network_CVPR_2023_paper.pdf>`_.
@@ -66,7 +67,7 @@ def mesh_from_splats_dlnr(
         This algorithm implemented is based on the paper
         `"GS2Mesh: Surface Reconstruction from Gaussian Splatting via Novel Stereo Views" <https://arxiv.org/abs/2404.01810>`_.
         We make key improvements to the method by using a more robust stereo baseline estimation method and by using a much
-        more efficient sparse TSDF fusion implementation built on `fVDB <https://openvdb.github.io/fvdb>`_.
+        more efficient sparse TSDF fusion implementation built on `fVDB <https://fvdb-core.readthedocs.io>`_.
 
     .. note::
 
@@ -91,6 +92,9 @@ def mesh_from_splats_dlnr(
             used to render images for mesh extraction where ``C`` is the number of camera views.
         image_sizes (NumericMaxRank2): A ``(C, 2)``-shaped Tensor containing the height and width of each image to extract
             from the Gaussian splat where ``C`` is the number of camera views. *i.e.*, ``image_sizes[c] = (height_c, width_c)``.
+        masks (torch.Tensor | None): An optional ``(C, N, H, W)``-shaped tensor containing ``N`` binary masks per image.
+            If provided, these masks will be forwarded to the TSDF extraction path and integrated as additional
+            feature channels. The masks are expected to be binary in [0,1].
         truncation_margin (float): Margin for truncating the TSDF, in world units. This defines the half-width of the band around the surface
             where the TSDF is defined in world units.
         grid_shell_thickness (float): The number of voxels along each axis to include in the TSDF volume.
@@ -123,16 +127,19 @@ def mesh_from_splats_dlnr(
         mesh_faces (torch.Tensor): A ``(F, 3)``-shaped tensor of faces of the extracted mesh.
         mesh_colors (torch.Tensor): A ``(V, D)``-shaped tensor of colors of the extracted mesh vertices
             where ``D`` is the number of channels encoded by the Gaussian Splat model (usually 3 for RGB colors).
+        mesh_mask (torch.Tensor): A ``(V, N)``-shaped tensor of mask values sampled at mesh vertices where ``N`` is the
+            number of mask channels integrated (0 if no masks were provided). Values are in [0,1] (float dtype).
     """
 
     camera_to_world_matrices, projection_matrices, image_sizes = validate_camera_matrices_and_image_sizes(
         camera_to_world_matrices, projection_matrices, image_sizes
     )
-    accum_grid, tsdf, colors = tsdf_from_splats_dlnr(
+    accum_grid, tsdf, colors, mask_volume = tsdf_from_splats_dlnr(
         model=model,
         camera_to_world_matrices=camera_to_world_matrices,
         projection_matrices=projection_matrices,
         image_sizes=image_sizes,
+        masks=masks,
         truncation_margin=truncation_margin,
         grid_shell_thickness=grid_shell_thickness,
         baseline=baseline,
@@ -152,5 +159,6 @@ def mesh_from_splats_dlnr(
     mesh_vertices, mesh_faces, _ = accum_grid.marching_cubes(tsdf, 0.0)
     mesh_colors = accum_grid.sample_trilinear(mesh_vertices, colors.to(dtype)) / 255.0
     mesh_colors.clip_(min=0.0, max=1.0)
+    mesh_mask = accum_grid.sample_trilinear(mesh_vertices, mask_volume.to(dtype))
 
-    return mesh_vertices, mesh_faces, mesh_colors
+    return mesh_vertices, mesh_faces, mesh_colors, mesh_mask
