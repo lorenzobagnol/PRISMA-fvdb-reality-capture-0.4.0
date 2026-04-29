@@ -1,0 +1,295 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+#
+
+"""
+Generate Gaussian splatting checkpoints for the benchmark.
+"""
+
+import logging
+import pathlib
+import subprocess
+import sys
+import time
+from typing import Dict, List
+
+import torch
+import yaml
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.resolve()))
+import fvdb_reality_capture as frc
+from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction_writer import (
+    GaussianSplatReconstructionWriter,
+)
+
+try:
+    from .contract import validate_benchmark_yaml
+except ImportError:  # Fallback when executed as a script (no package context)
+    from tests.benchmarks.contract import validate_benchmark_yaml
+
+logger = logging.getLogger("train benchmark checkpoints")
+
+
+def _coerce_config_value(target_obj: object, key: str, value):
+    """
+    Coerce YAML values into the expected Python types for config objects.
+
+    This is especially important for enum-typed fields, which are typically represented
+    as strings in YAML.
+    """
+    # Handle boolean conversion explicitly (yaml may parse some values as strings depending on source)
+    if isinstance(value, str) and value.lower() in ["true", "false"]:
+        value = value.lower() == "true"
+
+    if not hasattr(target_obj, key):
+        return value
+
+    current_value = getattr(target_obj, key)
+
+    # Coerce enum values from strings (and allow passing through already-correct enum values)
+    try:
+        import enum
+
+        if isinstance(current_value, enum.Enum):
+            if isinstance(value, str):
+                return type(current_value)(value)
+            return value
+    except Exception:
+        # If enum import/coercion fails for any reason, fall back to raw value
+        pass
+
+    return value
+
+
+def load_config(config_path: str = "benchmark_config.yaml") -> Dict:
+    """Load benchmark configuration from YAML file."""
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def save_config(config: Dict, config_path: str = "benchmark_config.yaml") -> None:
+    """Save benchmark configuration to YAML file."""
+    with open(config_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+def find_all_checkpoint_files(checkpoints_dir: pathlib.Path) -> List[str]:
+    """Recursively find all checkpoint files (*.pt containing "ckpt" in the filename) in the directory."""
+    checkpoint_paths = []
+
+    for file in checkpoints_dir.rglob("*.pt"):
+        if "ckpt" in file.name:
+            checkpoint_paths.append(str(file))
+
+    checkpoint_paths.sort()
+    return checkpoint_paths
+
+
+def _get_commit_hash() -> str:
+    """Return the current git commit hash, or a timestamp-based fallback if unavailable."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode("utf-8").strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        import datetime
+
+        return "nogit_" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
+def get_run_name(results_path: pathlib.Path) -> str:
+    """Get a unique run name for the current git commit hash."""
+    commit_hash = _get_commit_hash()
+    # Generate a run name based on the commit hash, appending an index if the directory exists
+    base_run_name = f"run_{commit_hash}"
+    run_name = base_run_name
+    idx = 1
+    while (results_path / run_name).exists():
+        run_name = f"{base_run_name}_{idx:02d}"
+        idx += 1
+    return run_name
+
+
+def main(
+    run_name: str | None = None,
+    results_base_path: pathlib.Path = pathlib.Path("results"),
+    config_path: str = "benchmark_config.yaml",
+):
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s : %(message)s")
+
+    # Load configuration
+    config = load_config(config_path)
+    validate_benchmark_yaml(config, require_run_paths=False)
+
+    # data base path
+    data_base_path = config["paths"]["data_base"]
+
+    # Get the current git commit hash of the repository
+    commit_hash = _get_commit_hash()
+    logger.info(f"Current git commit hash: {commit_hash}")
+
+    # Extract configuration
+    # save_at_percent = config["training"]["save_at_percent"]
+    datasets = config["datasets"]
+    training_params = config["optimization_config"]["training_arguments"]
+
+    # Determine the optimizer type
+    optimizer_class = (
+        frc.radiance_fields.GaussianSplatOptimizerMCMCConfig
+        if config["optimization_config"]["splat_optimizer"] == "GaussianSplatOptimizerMCMC"
+        else frc.radiance_fields.GaussianSplatOptimizerConfig
+    )
+
+    logger.info(f"Using optimizer class: {optimizer_class.__name__}")
+
+    # Create base Config object
+    base_config = frc.radiance_fields.GaussianSplatReconstructionConfig()
+    base_optimizer_config = optimizer_class()
+
+    # Override configs with values from YAML.
+    for key, value in config["optimization_config"].get("reconstruction_config", {}).items():
+        if hasattr(base_config, key):
+            setattr(base_config, key, _coerce_config_value(base_config, key, value))
+        else:
+            logger.warning(f"Ignoring unknown reconstruction_config field '{key}' (not present on {type(base_config)})")
+
+    for key, value in config["optimization_config"].get("optimization_config", {}).items():
+        if hasattr(base_optimizer_config, key):
+            setattr(base_optimizer_config, key, _coerce_config_value(base_optimizer_config, key, value))
+        else:
+            logger.warning(
+                f"Ignoring unknown optimization_config field '{key}' (not present on {type(base_config)} or {type(base_optimizer_config)})"
+            )
+
+    # Set save percentages
+    # base_config.save_at_percent = save_at_percent
+
+    # Create the results directory if it doesn't exist
+    results_base_path.mkdir(parents=True, exist_ok=True)
+
+    # Track generated checkpoint paths
+    generated_checkpoints = {}
+
+    for dataset_config in datasets:
+        dataset_name = dataset_config["name"]
+        dataset_path = pathlib.Path(data_base_path) / dataset_config["path"]
+
+        logger.info(f"Processing dataset: {dataset_name}")
+        logger.info(f"Dataset path: {dataset_path}")
+
+        # Create the dataset directory if it doesn't exist
+        dataset_results_path = results_base_path / dataset_name
+        dataset_results_path.mkdir(parents=True, exist_ok=True)
+
+        train = run_name is None
+
+        if train:
+            run_name = get_run_name(dataset_results_path)
+
+            # Reset GPU memory stats before any GPU operations for accurate peak measurement
+            device = torch.device(training_params.get("device", "cuda"))
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+
+            sfm_scene = frc.sfm_scene.SfmScene.from_colmap(dataset_path)
+            sfm_scene = frc.transforms.Compose(
+                frc.transforms.NormalizeScene("pca"),
+                frc.transforms.DownsampleImages(training_params["image_downsample_factor"]),
+            )(sfm_scene)
+
+            # Create the runner (this sets up datasets/transforms/cache) without including it in training time
+            logger.info(f"Preparing training run for {dataset_name} (initializing datasets/transforms/cache)...")
+            runner = frc.radiance_fields.GaussianSplatReconstruction.from_sfm_scene(
+                sfm_scene=sfm_scene,
+                writer=GaussianSplatReconstructionWriter(run_name=run_name, save_path=dataset_results_path),
+                config=base_config,
+                optimizer_config=base_optimizer_config,
+                use_every_n_as_val=training_params["use_every_n_as_val"],
+            )
+
+            # Start training-only timer
+            logger.info(f"Starting training for {dataset_name}...")
+            start_time = time.time()
+            runner.optimize()
+            training_time = time.time() - start_time
+
+            # Query peak GPU memory after training
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                peak_gpu_bytes = torch.cuda.max_memory_allocated(device)
+                peak_gpu_gb = peak_gpu_bytes / (1024**3)
+                # Print in parseable format for run_fvdb_training.py to extract
+                print(f"FVDB_PEAK_GPU_MEMORY_GB: {peak_gpu_gb:.6f}")
+
+            logger.info(f"Training completed for {dataset_name} in {training_time:.2f} seconds")
+        else:
+            logger.info(f"Skipping training for {dataset_name}")
+
+        # Find the generated run directory (timestamped)
+        run_dir = dataset_results_path / run_name
+
+        # Find checkpoint files
+        checkpoints_dir = run_dir / "checkpoints"
+
+        if checkpoints_dir.exists():
+            checkpoint_paths = find_all_checkpoint_files(checkpoints_dir)
+            generated_checkpoints[dataset_name] = {
+                "run_directory": str(run_dir),
+                "checkpoint_paths": checkpoint_paths,
+            }
+
+            logger.info(f"Found {len(checkpoint_paths)} checkpoint files for {dataset_name}")
+            for path in checkpoint_paths:
+                logger.info(f"  - {path}")
+        else:
+            logger.warning(f"Checkpoints directory not found: {checkpoints_dir}")
+            # Still create the entry even if no checkpoints found
+            generated_checkpoints[dataset_name] = {
+                "run_directory": str(run_dir),
+                "checkpoint_paths": [],
+            }
+
+    # Update the configuration with generated checkpoint paths
+    for dataset_config in datasets:
+        dataset_name = dataset_config["name"]
+        if dataset_name in generated_checkpoints:
+            dataset_config["run_directory"] = generated_checkpoints[dataset_name]["run_directory"]
+            dataset_config["checkpoint_paths"] = generated_checkpoints[dataset_name]["checkpoint_paths"]
+
+    # Save updated configuration
+    save_config(config, config_path)
+    logger.info(f"Updated configuration saved to benchmark_config.yaml")
+    logger.info("Checkpoint paths have been added to the configuration file.")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    if __name__ == "__main__":
+        parser = argparse.ArgumentParser(description="Generate Gaussian splatting checkpoints for the benchmark.")
+        parser.add_argument(
+            "--config",
+            default="benchmark_config.yaml",
+            help="Path to the benchmark configuration file (default: benchmark_config.yaml)",
+        )
+        parser.add_argument(
+            "--results-base-path",
+            default="results",
+            help=(
+                "Base directory to write benchmark results to. "
+                "The script will create per-dataset subdirectories under this path."
+            ),
+        )
+        parser.add_argument(
+            "--find-checkpoints-run-name",
+            help=(
+                "Skip training and look for checkpoints in the specified run directory name, "
+                "and populate benchmark_config.yaml with the paths to the checkpoints."
+            ),
+        )
+
+        args = parser.parse_args()
+        main(
+            run_name=args.find_checkpoints_run_name,
+            results_base_path=pathlib.Path(args.results_base_path),
+            config_path=args.config,
+        )

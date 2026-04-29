@@ -1,0 +1,83 @@
+# Use condaforge/miniforge3 base image
+FROM condaforge/miniforge3:24.11.3-2
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CONDA_AUTO_UPDATE_CONDA=false
+ENV CONDA_OVERRIDE_CUDA=12.9
+ENV PATH="/opt/conda/bin:$PATH"
+
+# Install system dependencies for building
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    unzip \
+    wget \
+    gnupg2 \
+    libglm-dev \
+    passwd \
+    util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add NVIDIA repository for latest Nsight Systems
+RUN wget -qO - https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub | apt-key add - && \
+    echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /" > /etc/apt/sources.list.d/cuda.list
+
+# Install latest Nsight Systems and create symlink
+# Uncomment to profile training in the container
+# RUN apt-get update && apt-get install -y \
+#     nsight-systems-2025.3.2 \
+#     && rm -rf /var/lib/apt/lists/* \
+#     && ln -sf /opt/nvidia/nsight-systems/2025.3.2/bin/nsys /usr/local/bin/nsys
+
+# Copy conda environment file
+COPY docker/benchmark_environment.yml /tmp/benchmark_environment.yml
+
+# Create conda environment
+RUN conda env create -f /tmp/benchmark_environment.yml
+
+# For some reason conda is silently skipping scikit-build-core and cmake installation
+# Install missing dependencies that might not be installed due to conflicts
+RUN conda run -n benchmark conda install -c conda-forge scikit-build-core cmake -y
+
+# Patch pycolmap after installation
+RUN conda run -n benchmark sed -i 's/INVALID_POINT3D = np.uint64(-1)/INVALID_POINT3D = np.uint64(2**64-1)/' $(conda run -n benchmark python -c 'import site; print(site.getsitepackages()[0])')/pycolmap/scene_manager.py
+
+# Initialize conda
+RUN conda init
+RUN echo "conda activate benchmark" >> ~/.bashrc
+
+# Set working directory
+WORKDIR /workspace
+
+# Clone GSplat repository at a pinned commit for reproducibility.
+# b60e917 is HEAD of main, includes the DefaultStrategy opacity-reset fix (6e8c837).
+ARG GSPLAT_COMMIT=b60e917c95afc449c5be33a634f1f457e116ff5e
+RUN git clone https://github.com/nerfstudio-project/gsplat.git gsplat \
+    && cd gsplat && git checkout ${GSPLAT_COMMIT} && git submodule update --init --recursive \
+    && echo "GSplat pinned to: $(git rev-parse HEAD)"
+
+# Create directories for results
+RUN mkdir -p results/benchmark/summary
+
+# Allow the runtime-mapped (host) UID/GID to write into the conda env and gsplat tree
+# (the container drops root privileges at runtime via docker/uid_entrypoint.sh).
+RUN chmod -R a+rwX /opt/conda/envs/benchmark /opt/conda/pkgs /workspace/gsplat /workspace/results
+
+# UID/GID mapping entrypoint (runs as root briefly, then drops privileges)
+COPY docker/uid_entrypoint.sh /usr/local/bin/uid_entrypoint.sh
+RUN chmod +x /usr/local/bin/uid_entrypoint.sh
+
+# Set default conda environment
+ENV CONDA_DEFAULT_ENV=benchmark
+ENV PATH="/opt/conda/envs/benchmark/bin:$PATH"
+
+# Set CUDA environment variables for compilation
+ENV CUDA_HOME="/opt/conda/envs/benchmark"
+ENV CUDA_PATH="/opt/conda/envs/benchmark"
+ENV CPATH="/opt/conda/envs/benchmark/targets/x86_64-linux/include:$CPATH"
+ENV LD_LIBRARY_PATH="/opt/conda/envs/benchmark/targets/x86_64-linux/lib:$LD_LIBRARY_PATH"
+ENV LIBRARY_PATH="/opt/conda/envs/benchmark/targets/x86_64-linux/lib:$LIBRARY_PATH"
+
+# Expose ports for visualization
+EXPOSE 8080 8081

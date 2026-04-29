@@ -1,0 +1,636 @@
+name: fvdb-reality-capture Nightly Benchmarks
+
+on:
+  schedule:
+    - cron: "00 11 * * *"  # Runs every day at 4am pacific/11am UTC
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build"
+        required: true
+        default: "main"
+      comparative_matrix:
+        description: "Comparative benchmark matrix file (relative to tests/benchmarks/comparative/)"
+        required: false
+        default: "nightly_matrix.yml"
+
+# Allow subsequent pushes to the same PR or REF to cancel any previous jobs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write  # Required to push benchmark results to gh-pages
+  deployments: read
+  pull-requests: read
+  issues: read
+  actions: read  # Required to download artifacts from previous workflow runs
+  # Need ID token write permission to use OIDC
+  id-token: write
+
+jobs:
+  # Get current commit hash of fvdb-core main and store in a variable
+  get-fvdb-core-commit-hash:
+    if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
+    name: Get fvdb-core commit hash
+    runs-on: ubuntu-latest
+    outputs:
+      fvdb_core_commit_hash: ${{ steps.get-commit-hash.outputs.fvdb_core_commit_hash }}
+      fvdb_reality_capture_commit_hash: ${{ steps.get-commit-hash.outputs.fvdb_reality_capture_commit_hash }}
+      should_skip: ${{ steps.check-changes.outputs.should_skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Get fvdb-core commit hash
+        id: get-commit-hash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Install GitHub CLI if not already installed
+          if ! command -v gh &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          # Use the GitHub CLI to fetch the latest commit hash from the main branch of fvdb-core
+          FVDB_CORE_COMMIT_HASH=$(gh api repos/openvdb/fvdb-core/commits/main --jq .sha)
+          echo "FVDB_CORE_COMMIT_HASH=${FVDB_CORE_COMMIT_HASH}"
+          echo "fvdb_core_commit_hash=${FVDB_CORE_COMMIT_HASH}" >> "$GITHUB_OUTPUT"
+
+          # Get fvdb-reality-capture commit hash (current commit)
+          FVDB_RC_COMMIT_HASH="${{ github.sha }}"
+          echo "FVDB_RC_COMMIT_HASH=${FVDB_RC_COMMIT_HASH}"
+          echo "fvdb_reality_capture_commit_hash=${FVDB_RC_COMMIT_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if commits changed since last run
+        id: check-changes
+        run: |
+          SHOULD_SKIP="false"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch -- always run."
+          elif [ -f "gh-pages/dev/bench/last_run_commits.txt" ]; then
+            echo "Found last run commits file"
+            cat gh-pages/dev/bench/last_run_commits.txt
+
+            LAST_FVDB_CORE=$(grep "fvdb_core:" gh-pages/dev/bench/last_run_commits.txt | cut -d' ' -f2)
+            LAST_FVDB_RC=$(grep "fvdb_reality_capture:" gh-pages/dev/bench/last_run_commits.txt | cut -d' ' -f2)
+
+            CURRENT_FVDB_CORE="${{ steps.get-commit-hash.outputs.fvdb_core_commit_hash }}"
+            CURRENT_FVDB_RC="${{ steps.get-commit-hash.outputs.fvdb_reality_capture_commit_hash }}"
+
+            echo "Last run - fvdb-core: ${LAST_FVDB_CORE}, fvdb-reality-capture: ${LAST_FVDB_RC}"
+            echo "Current  - fvdb-core: ${CURRENT_FVDB_CORE}, fvdb-reality-capture: ${CURRENT_FVDB_RC}"
+
+            if [ -n "${LAST_FVDB_CORE}" ] && [ -n "${LAST_FVDB_RC}" ] && \
+              [ "${LAST_FVDB_CORE}" = "${CURRENT_FVDB_CORE}" ] && \
+              [ "${LAST_FVDB_RC}" = "${CURRENT_FVDB_RC}" ]; then
+              echo "No changes detected. Skipping workflow."
+              SHOULD_SKIP="true"
+            else
+              echo "Changes detected. Running workflow."
+            fi
+          else
+            echo "No previous run found. Running workflow."
+          fi
+
+          echo "should_skip=${SHOULD_SKIP}" >> "$GITHUB_OUTPUT"
+  ##############################################################################
+  # BUILD FVDB
+  ##############################################################################
+  start-build-runner:
+    if: ${{ github.repository == 'openvdb/fvdb-reality-capture' && needs.get-fvdb-core-commit-hash.outputs.should_skip != 'true' }}
+    name: Start CPU-only EC2 runner for build
+    needs: get-fvdb-core-commit-hash
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.start-build-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-build-runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role
+          aws-region: us-east-2
+      - name: Start EC2 runner
+        id: start-build-runner
+        uses: machulav/ec2-github-runner@v2.4.3
+        with:
+          mode: start
+          github-token: ${{ secrets.EC2_RUNNERS_ACTION }}
+          ec2-image-id: ami-0e14a711dad782a70
+          ec2-instance-type: m6a.8xlarge
+          subnet-id: subnet-03f2320d6e6e0005b
+          security-group-id: sg-0cd08bd89d6212223
+  fvdb-reality-capture-build:
+    if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
+    name: fvdb-reality-capture Build
+    needs:
+      - get-fvdb-core-commit-hash
+      - start-build-runner # required to start the main job when the runner is ready
+    runs-on: ${{ needs.start-build-runner.outputs.label }} # run the job on the newly created runner
+    container:
+      image: aswf/ci-openvdb:2024-clang17.2
+      env:
+        PYTHONPATH: ""
+        CPM_SOURCE_CACHE: "/__w/cpm_cache"
+        CONDA_OVERRIDE_CUDA: "13.0"  # this is to build an environment on machines that lack a CUDA device and needs to match the CUDA version in the build_environment.yml file
+      options: --rm
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch || 'main' }}
+
+      - name: Try to download existing fvdb-core wheel
+        id: download_existing_wheel
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
+          path: fvdb-core/dist
+          workflow: nightly.yml
+          workflow_conclusion: ""  # Search in runs with any conclusion (success, failure, cancelled)
+          search_artifacts: true  # Search across multiple runs to find the artifact
+          if_no_artifact_found: fail
+
+      - name: Log if fvdb-core wheel already exists
+        if: steps.download_existing_wheel.outcome == 'success'
+        run: echo "Artifact 'fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}' exists. No need to rebuild."
+
+      # TODO: DRY this up with an anchor
+      - name: Clone fvdb-core
+        if: steps.download_existing_wheel.outcome == 'failure'
+        id: clone_fvdb_core
+        run: |
+          echo "Cloning fvdb-core"
+          pwd
+          git clone https://github.com/openvdb/fvdb-core.git
+          git -C fvdb-core checkout ${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
+
+      - name: Set up fvdb-core conda env
+        if: steps.download_existing_wheel.outcome == 'failure'
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          post-cleanup: 'all'
+          environment-name: fvdb_build
+          environment-file: fvdb-core/env/build_environment.yml
+
+      - name: Build fvdb-core
+        if: steps.download_existing_wheel.outcome == 'failure'
+        run: |
+          echo "Building fvdb"
+          cd fvdb-core
+          micromamba activate fvdb_build
+          ./build.sh wheel verbose --cuda-arch-list '8.9+PTX'
+
+      - name: Upload fvdb wheel
+        if: steps.download_existing_wheel.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
+          path: fvdb-core/dist/*.whl
+          retention-days: 30
+
+  fvdb-build-stop-runner:
+    if: ${{ always() && github.repository == 'openvdb/fvdb-reality-capture' && needs.start-build-runner.result != 'skipped' }}
+    name: Stop CPU-only EC2 runner for build
+    needs:
+      - start-build-runner # required to get output from the start-build-runner job
+      - fvdb-reality-capture-build # required to wait when the main job is done
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role
+          aws-region: us-east-2
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2.4.3
+        with:
+          mode: stop
+          github-token: ${{ secrets.EC2_RUNNERS_ACTION }}
+          label: ${{ needs.start-build-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-build-runner.outputs.ec2-instance-id }}
+
+
+  ##############################################################################
+  # START FVDB REALITY CAPTURE BENCHMARKS GPU RUNNER
+  ##############################################################################
+  start-benchmarks-gpu-runner:
+    if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
+    name: Start EC2 GPU runner for benchmarks
+    needs: fvdb-reality-capture-build
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.start-tests-gpu-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-tests-gpu-runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role
+          aws-region: us-east-2
+      - name: Start EC2 GPU runner
+        id: start-tests-gpu-runner
+        uses: machulav/ec2-github-runner@v2.4.3
+        with:
+          mode: start
+          github-token: ${{ secrets.EC2_RUNNERS_ACTION }}
+          ec2-image-id: ami-0f5c0b65fde08ae43
+          ec2-instance-type: g6.xlarge # 4 CPU-core, L4 GPU
+          subnet-id: subnet-03f2320d6e6e0005b
+          security-group-id: sg-0cd08bd89d6212223
+
+  ##############################################################################
+  # RUN FVDB REALITY CAPTURE UNIT BENCHMARKS
+  ##############################################################################
+  fvdb-reality-capture-unit-benchmarks:
+    if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
+    needs:
+      - get-fvdb-core-commit-hash
+      - start-benchmarks-gpu-runner # required to start the main job when the runner is ready
+    name: fvdb-reality-capture Unit Benchmarks
+    runs-on: ${{ needs.start-benchmarks-gpu-runner.outputs.label }} # run the job on the newly created runner
+    container:
+      image: aswf/ci-openvdb:2024-clang17.2
+      env:
+        PYTHONPATH: ""
+        CPM_SOURCE_CACHE: "/__w/cpm_cache"
+      options: --rm
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || 'main' }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role
+          aws-region: us-east-2
+
+      - name: Set up benchmark Conda env
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          cache-environment: false
+          post-cleanup: 'all'
+          environment-name: benchmark
+          environment-file: tests/benchmarks/comparative/docker/benchmark_environment.yml
+
+      - name: Download fvdb-core wheel
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
+          path: ./dist
+          workflow: nightly.yml
+          workflow_conclusion: ""
+          search_artifacts: true
+          if_no_artifact_found: fail
+
+      - name: Install fVDB and fvdb-reality-capture
+        run: |
+          micromamba activate benchmark
+          pip install ./dist/*.whl
+          pip install -e .
+
+      - name: Download mipnerf360 dataset
+        run: |
+          micromamba activate benchmark
+          frgs download mipnerf360 --download-path ./data
+
+      - name: Download config and checkpoints from S3
+        run: |
+          micromamba activate benchmark
+          cd tests/benchmarks
+          python download_checkpoints_from_s3.py
+
+      - name: Run benchmarks
+        run: |
+          micromamba activate benchmark
+          cd tests
+          pytest benchmarks/test_3dgs.py --benchmark-json benchmarks/output.json
+
+      - name: Add commit metadata to benchmark results
+        run: |
+          # Add both commit hashes to the benchmark JSON for reference
+          python3 << 'EOF'
+          import json
+
+          with open('tests/benchmarks/output.json', 'r') as f:
+              data = json.load(f)
+
+          # Add metadata about both commits
+          if 'commit_info' not in data:
+              data['commit_info'] = {}
+
+          data['commit_info']['fvdb_core_commit'] = '${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}'
+          data['commit_info']['fvdb_reality_capture_commit'] = '${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_reality_capture_commit_hash }}'
+
+          with open('tests/benchmarks/output.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          EOF
+
+      - name: Clean up modified benchmark_config.yaml
+        run: |
+          # Remove the locally modified benchmark_config.yaml to avoid conflicts when switching branches
+          # This file is downloaded and modified by download_checkpoints_from_s3.py
+          git checkout -- tests/benchmarks/benchmark_config.yaml || true
+          # Clean up but exclude output.json which contains benchmark results
+          git clean -fd tests/benchmarks/ -e tests/benchmarks/output.json || true
+
+      - name: Store benchmark result
+        id: store-benchmark
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+            name: fvdb-reality-capture Benchmark with pytest-benchmark
+            tool: 'pytest'
+            output-file-path: tests/benchmarks/output.json
+            github-token: ${{ secrets.GITHUB_TOKEN }}
+            auto-push: true
+            # Show alert with commit comment on detecting possible performance regression
+            alert-threshold: '200%'
+            comment-on-alert: true
+            fail-on-alert: true
+            alert-comment-cc-users: '@openvdb/fvdb-dev'
+            # Always comment on benchmark results, even without alerts
+            comment-always: true
+
+      - name: Save commit hashes for next run
+        if: steps.store-benchmark.outcome == 'success' || steps.store-benchmark.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check out gh-pages branch with token authentication
+          rm -rf gh-pages-repo
+          git clone --branch gh-pages https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git gh-pages-repo
+          cd gh-pages-repo
+
+          # Create directory if it doesn't exist
+          mkdir -p dev/bench
+
+          # Save current commit hashes for skip detection
+          cat > dev/bench/last_run_commits.txt << EOF
+          fvdb_core: ${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
+          fvdb_reality_capture: ${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_reality_capture_commit_hash }}
+          EOF
+
+          # Append to commit mapping log (for historical tracking)
+          echo "$(date -Iseconds) | fvdb-reality-capture: ${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_reality_capture_commit_hash }} | fvdb-core: ${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}" >> dev/bench/commit_mapping.log
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Commit and push
+          git add dev/bench/last_run_commits.txt dev/bench/commit_mapping.log
+          git commit -m "Save commit hashes for workflow run ${{ github.run_id }}" || echo "No changes to commit"
+          git push || { echo "Failed to push commit hashes. This may cause the next run to not skip properly."; exit 1; }
+
+  ##############################################################################
+  # STOP FVDB UNIT BENCHMARKS GPU RUNNER
+  ##############################################################################
+  fvdb-benchmarks-stop-gpu-runner:
+    if: ${{ always() && github.repository == 'openvdb/fvdb-reality-capture' && needs.start-benchmarks-gpu-runner.result != 'skipped' }}
+    name: Stop GPU EC2 runner for unit benchmarks
+    needs:
+      - start-benchmarks-gpu-runner
+      - fvdb-reality-capture-unit-benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role
+          aws-region: us-east-2
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2.4.3
+        with:
+          mode: stop
+          github-token: ${{ secrets.EC2_RUNNERS_ACTION }}
+          label: ${{ needs.start-benchmarks-gpu-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-benchmarks-gpu-runner.outputs.ec2-instance-id }}
+
+  ##############################################################################
+  # START COMPARATIVE BENCHMARKS GPU RUNNER
+  ##############################################################################
+  start-comparative-gpu-runner:
+    if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
+    name: Start EC2 GPU runner for comparative benchmarks
+    needs: fvdb-reality-capture-build
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.start-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role
+          aws-region: us-east-2
+      - name: Start EC2 GPU runner
+        id: start-runner
+        uses: machulav/ec2-github-runner@v2.4.3
+        with:
+          mode: start
+          github-token: ${{ secrets.EC2_RUNNERS_ACTION }}
+          ec2-image-id: ami-0f5c0b65fde08ae43
+          ec2-instance-type: g6.xlarge
+          subnet-id: subnet-03f2320d6e6e0005b
+          security-group-id: sg-0cd08bd89d6212223
+
+  ##############################################################################
+  # RUN COMPARATIVE BENCHMARKS
+  ##############################################################################
+  fvdb-reality-capture-comparative-benchmarks:
+    if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
+    needs:
+      - get-fvdb-core-commit-hash
+      - start-comparative-gpu-runner
+    name: fvdb-reality-capture Comparative Benchmarks
+    runs-on: ${{ needs.start-comparative-gpu-runner.outputs.label }}
+    container:
+      image: aswf/ci-openvdb:2024-clang17.2
+      env:
+        PYTHONPATH: ""
+        CPM_SOURCE_CACHE: "/__w/cpm_cache"
+      options: --rm --shm-size 16gb
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch || 'main' }}
+
+      - name: Set up benchmark Conda env
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          cache-environment: false
+          post-cleanup: 'all'
+          environment-name: benchmark
+          environment-file: tests/benchmarks/comparative/docker/benchmark_environment.yml
+
+      - name: Download fvdb-core wheel
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
+          path: ./dist
+          workflow: nightly.yml
+          workflow_conclusion: ""
+          search_artifacts: true
+          if_no_artifact_found: fail
+
+      - name: Install fVDB and fvdb-reality-capture
+        run: |
+          micromamba activate benchmark
+          pip install ./dist/*.whl
+          pip install -e .
+
+      - name: Clone and build GSplat
+        run: |
+          micromamba activate benchmark
+          mkdir -p /workspace
+          GSPLAT_COMMIT="b60e917c95afc449c5be33a634f1f457e116ff5e"  # HEAD of main, includes DefaultStrategy opacity-reset fix (6e8c837)
+          git clone https://github.com/nerfstudio-project/gsplat.git /workspace/gsplat
+          cd /workspace/gsplat && git checkout "${GSPLAT_COMMIT}" && git submodule update --init --recursive
+          echo "GSplat pinned to commit: $(git rev-parse HEAD)"
+          archs=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+                  | awk NF | sort -u | sed 's/$/+PTX/')
+          [ -z "$archs" ] && archs="8.9+PTX"
+          export TORCH_CUDA_ARCH_LIST="$archs"
+          export CUDAARCHS=$(echo "$archs" | tr ';' '\n' | sed 's/+PTX//' | tr -d . | paste -sd',' -)
+          echo "Building GSplat with TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
+          pip install -v --no-build-isolation --no-cache-dir /workspace/gsplat
+
+      - name: Install fused-ssim
+        run: |
+          micromamba activate benchmark
+          pip install -v --no-build-isolation --no-cache-dir \
+            "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5"
+
+      - name: Download mipnerf360 dataset
+        run: |
+          micromamba activate benchmark
+          mkdir -p /workspace/data
+          frgs download mipnerf360 --download-path /workspace/data
+
+      - name: Patch pycolmap
+        run: |
+          micromamba activate benchmark
+          SITE=$(python -c 'import site; print(site.getsitepackages()[0])')
+          sed -i 's/INVALID_POINT3D = np.uint64(-1)/INVALID_POINT3D = np.uint64(2**64-1)/' \
+            "$SITE/pycolmap/scene_manager.py" || true
+
+      - name: GSplat L4 warmup
+        run: |
+          micromamba activate benchmark
+          echo "Running 500-step gsplat warmup to avoid L4 cold-start training bug."
+          echo "See: https://github.com/nerfstudio-project/gsplat/issues/872"
+          echo "gsplat commit: b60e917c95afc449c5be33a634f1f457e116ff5e"
+          echo "Remove this step once the upstream issue is resolved."
+          cd /workspace/gsplat/examples
+          python simple_trainer.py default \
+            --disable_viewer --disable_video \
+            --data_factor 4 \
+            --data_dir /workspace/data/360_v2/bonsai \
+            --result_dir /tmp/gsplat_warmup \
+            --max_steps 500 \
+            --batch_size 1
+          rm -rf /tmp/gsplat_warmup
+          echo "Warmup complete."
+
+      - name: Run comparative benchmark
+        run: |
+          micromamba activate benchmark
+          cd tests/benchmarks/comparative
+          python comparison_benchmark.py --matrix ${{ github.event.inputs.comparative_matrix || 'nightly_matrix.yml' }}
+
+      - name: Convert results to benchmark format
+        if: ${{ github.event.inputs.comparative_matrix == '' || github.event.inputs.comparative_matrix == null || github.event.inputs.comparative_matrix == 'nightly_matrix.yml' }}
+        run: |
+          micromamba activate benchmark
+          cd tests/benchmarks/comparative
+          python format_for_gh_benchmark.py \
+            results/nightly_benchmark/summary/summary_data.json \
+            --output-dir results/nightly_benchmark/summary
+
+      - name: Clean up modified files
+        if: ${{ github.event.inputs.comparative_matrix == '' || github.event.inputs.comparative_matrix == null || github.event.inputs.comparative_matrix == 'nightly_matrix.yml' }}
+        run: |
+          git checkout -- tests/benchmarks/ || true
+          git clean -fd tests/benchmarks/ \
+            -e tests/benchmarks/comparative/results/ || true
+
+      - name: Store quality benchmark results
+        if: ${{ github.event.inputs.comparative_matrix == '' || github.event.inputs.comparative_matrix == null || github.event.inputs.comparative_matrix == 'nightly_matrix.yml' }}
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: fvdb-reality-capture Comparative Quality
+          tool: 'customBiggerIsBetter'
+          output-file-path: tests/benchmarks/comparative/results/nightly_benchmark/summary/benchmark_quality.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '110%'
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-comment-cc-users: '@openvdb/fvdb-dev'
+
+      - name: Store performance benchmark results
+        if: ${{ github.event.inputs.comparative_matrix == '' || github.event.inputs.comparative_matrix == null || github.event.inputs.comparative_matrix == 'nightly_matrix.yml' }}
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: fvdb-reality-capture Comparative Performance
+          tool: 'customSmallerIsBetter'
+          output-file-path: tests/benchmarks/comparative/results/nightly_benchmark/summary/benchmark_performance.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-comment-cc-users: '@openvdb/fvdb-dev'
+
+      - name: Upload comparative benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparative-benchmark-results-${{ github.run_id }}
+          path: |
+            tests/benchmarks/comparative/results/*/summary/
+            tests/benchmarks/comparative/results/*/*.png
+            tests/benchmarks/comparative/results/*/*.json
+            tests/benchmarks/comparative/results/*/benchmark.log
+          retention-days: 90
+
+  ##############################################################################
+  # STOP COMPARATIVE BENCHMARKS GPU RUNNER
+  ##############################################################################
+  fvdb-comparative-stop-gpu-runner:
+    if: ${{ always() && github.repository == 'openvdb/fvdb-reality-capture' && needs.start-comparative-gpu-runner.result != 'skipped' }}
+    name: Stop GPU EC2 runner for comparative benchmarks
+    needs:
+      - start-comparative-gpu-runner
+      - fvdb-reality-capture-comparative-benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role
+          aws-region: us-east-2
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2.4.3
+        with:
+          mode: stop
+          github-token: ${{ secrets.EC2_RUNNERS_ACTION }}
+          label: ${{ needs.start-comparative-gpu-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-comparative-gpu-runner.outputs.ec2-instance-id }}
