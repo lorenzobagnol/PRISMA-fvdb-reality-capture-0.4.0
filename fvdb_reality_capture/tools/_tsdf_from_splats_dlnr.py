@@ -485,7 +485,7 @@ def tsdf_from_splats_dlnr(
     use_absolute_baseline: bool = False,
     show_progress: bool = True,
     num_workers: int = 8,
-) -> tuple[Grid, torch.Tensor, torch.Tensor]:
+) -> tuple[Grid, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract a Truncated Signed Distance Field (TSDF) from a `fvdb.GaussianSplat3d` using TSDF fusion from depth maps
     predicted from the Gaussian splat radiance field and the
@@ -575,6 +575,8 @@ def tsdf_from_splats_dlnr(
         accum_grid (Grid): The accumulated :class:`fvdb.Grid` representing the voxels in the TSDF volume.
         tsdf (torch.Tensor): The TSDF values for each voxel in the grid.
         colors (torch.Tensor): The colors/features for each voxel in the grid.
+        masks (torch.Tensor): A ``(V,)`` or ``(V, M)`` tensor of mask values for each voxel where ``V`` is the number of voxels
+            and ``M`` is the number of mask channels integrated (0 if no masks were provided). Values are in [0,1] (float dtype).
     """
 
     if model.num_channels != 3:
@@ -737,11 +739,8 @@ def tsdf_from_splats_dlnr(
                 mask_feats = mask_feats.float().div(255.0).to(dtype)
             else:
                 mask_feats = mask_feats.to(dtype)
-            if mask_feats.ndim == 2 and mask_feats.shape[1] == 1:
-                filter_mask = mask_feats.squeeze(-1)
-            else:
-                filter_mask = mask_feats
+            filter_mask = mask_feats
         else:
-            filter_mask = torch.zeros(new_grid.num_voxels, device=device, dtype=dtype)
+            filter_mask = torch.zeros((new_grid.num_voxels, 1), device=device, dtype=dtype)
 
     return new_grid, filter_tsdf, filter_colors, filter_mask
