@@ -131,7 +131,8 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             dlnr_model (DLNRModel): The DLNR model to compute optical flow and disparity.
             use_absolute_baseline (bool): If True, use the provided baseline as an absolute distance in world units.
             show_progress (bool): Whether to show a progress bar (default is True).
-            masks (torch.Tensor | None): A tensor containing masks for each image.
+            masks (torch.Tensor | None): An optional (C, N, H, W) tensor of N binary masks per image,
+                where N >= 1. Supports both single-channel (N=1) and multi-channel (N>1) masks.
         """
         if not cache_path.exists():
             cache_path.mkdir(parents=True, exist_ok=True)
@@ -164,13 +165,12 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             projection_matrix = projection_matrices[i].to(dtype=torch.float32, device=device)
             image_height, image_width = int(image_sizes[i][0].item()), int(image_sizes[i][1].item())
 
-            # debug_img_name = f"debug_image_{i:04d}.png"
             rgb_image, depth_image, weight_image = self.extract_single_tsdf_input(
                 world_to_cam_matrix=world_to_cam_matrix,
                 projection_matrix=projection_matrix,
                 image_width=image_width,
                 image_height=image_height,
-                save_debug_images_to=None,  # Set to a path if you want to save debug images
+                save_debug_images_to=None,
             )
 
             self.cache.write_file(f"rgb_{i}", rgb_image.cpu().numpy(), data_type="npy")
@@ -178,11 +178,9 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             self.cache.write_file(f"weight_{i}", weight_image.cpu().numpy(), data_type="npy")
 
             if self.masks is not None:
-                # assumiamo masks shape (C, H, W) in [0,1] o {0,1}
-                mask_i = self.masks[i].cpu().numpy()
+                # masks[i] is (N, H, W) — preserve all N channels, including N=1
+                mask_i = self.masks[i].cpu().numpy()   # (N, H, W)
                 self.cache.write_file(f"mask_{i}", mask_i, data_type="npy")
-
-
 
     def extract_single_tsdf_input(
         self,
@@ -208,7 +206,6 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             projection_matrix (torch.Tensor): The projection matrix for the camera.
             image_width (int): The width of the rendered images in pixels.
             image_height (int): The height of the rendered images in pixels.
-            alpha_threshold (float): Alpha threshold to mask pixels where the Gaussian splat model is not confident.
             save_debug_images_to (str | None): If provided, saves debug images to this path.
 
         Returns:
@@ -457,10 +454,10 @@ class TSDFInputDataset(torch.utils.data.Dataset):
 
         try:
             _, mask = self.cache.read_file(f"mask_{idx}")
-            mask_t = torch.from_numpy(mask)
+            # mask is (N, H, W) numpy array — preserve shape, including N=1
+            mask_t = torch.from_numpy(mask)   # (N, H, W)
             return rgb_t, depth_t, weight_t, mask_t
-        except FileNotFoundError:
-            # Nessuna maschera per questo dataset
+        except (FileNotFoundError, ValueError):
             return rgb_t, depth_t, weight_t, None
 
 
@@ -472,7 +469,7 @@ def tsdf_from_splats_dlnr(
     image_sizes: NumericMaxRank2,
     truncation_margin: float,
     masks: torch.Tensor | None = None,
-    grid_shell_thickness: float | int = 3.0,
+    grid_shell_thickness: float | int = 6.0,
     baseline: float = 0.07,
     near: float = 4.0,
     far: float = 20.0,
@@ -544,8 +541,9 @@ def tsdf_from_splats_dlnr(
         truncation_margin (float): Margin for truncating the TSDF, in world units. This defines the half-width of the band around the surface
             where the TSDF is defined in world units.
         masks (torch.Tensor | None): A tensor of shape (C, N, H, W) containing N binary masks for each image.
-            If provided, these masks will be combined with the occlusion and near/far masks to compute the final weights for TSDF fusion.
-            Default is None, meaning no additional masks are applied.
+            Supports N=1 (single mask channel) and N>1 (multiple mask channels concatenated).
+            If provided, mask channels are integrated as extra feature channels alongside RGB and returned
+            in the filter_mask output. Default is None.
         grid_shell_thickness (float): The number of voxels along each axis to include in the TSDF volume.
             This defines the resolution of the Grid around narrow band around the surface.
             Default is 3.0.
@@ -574,9 +572,10 @@ def tsdf_from_splats_dlnr(
     Returns:
         accum_grid (Grid): The accumulated :class:`fvdb.Grid` representing the voxels in the TSDF volume.
         tsdf (torch.Tensor): The TSDF values for each voxel in the grid.
-        colors (torch.Tensor): The colors/features for each voxel in the grid.
-        masks (torch.Tensor): A ``(V,)`` or ``(V, M)`` tensor of mask values for each voxel where ``V`` is the number of voxels
-            and ``M`` is the number of mask channels integrated (0 if no masks were provided). Values are in [0,1] (float dtype).
+        colors (torch.Tensor): The RGB colors for each voxel in the grid, shape (V, 3).
+        filter_mask (torch.Tensor): Mask values per voxel, always shape (V, N) where N >= 1.
+            If no masks were provided, returns a zero tensor of shape (V, 1).
+            Values are in [0, 1] (float dtype).
     """
 
     if model.num_channels != 3:
@@ -614,12 +613,9 @@ def tsdf_from_splats_dlnr(
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
 
         device = model.device
-        # The voxel size is set by dividing the truncation margin by the grid shell thickness.
-        # This ensures that the truncation margin spans 'grid_shell_thickness' number of voxels,
-        # controlling the grid resolution and mesh quality. Adjusting grid_shell_thickness changes
-        # how many voxels fit within the truncation margin, affecting surface detail.
         voxel_size = truncation_margin / grid_shell_thickness
-        # If masks were provided, reserve additional feature channels to store them
+        # N mask channels are stored as extra feature channels appended to RGB (3 ch).
+        # mask_channel_count == 0 when masks is None.
         mask_channel_count = masks.shape[1] if masks is not None else 0
         accum_grid = Grid.from_dense(dense_dims=1, ijk_min=0, voxel_size=voxel_size, origin=0.0, device=device)
         tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
@@ -652,29 +648,26 @@ def tsdf_from_splats_dlnr(
             depth_image = depth_image.to(dtype)
             weight_image = weight_image.to(dtype)
 
-            # Prepare mask feature channels (if provided) in the same feature dtype
+            # Prepare mask feature channels (if provided) in the same feature dtype.
+            # mask_image from __getitem__ is (N, H, W); DataLoader wraps it to (B, N, H, W).
             mask_feat = None
             if mask_image is not None:
-                # mask_image from the dataset can be either [N, H, W] or batched [B, N, H, W].
-                # We want a channel-last tensor [B, H, W, N] so it can be concatenated with rgb.
+                # Normalise to (B, N, H, W) — handle both batched and unbatched cases
                 if mask_image.dim() == 3:
-                    # [N, H, W] -> [1, N, H, W]
-                    mask_image = mask_image.unsqueeze(0)
-                # Now mask_image is [B, N, H, W]
-                mask_image = mask_image.permute(0, 2, 3, 1).contiguous()  # [B, H, W, N]
+                    mask_image = mask_image.unsqueeze(0)   # (N, H, W) → (1, N, H, W)
+                # (B, N, H, W) → (B, H, W, N) channel-last for concatenation with rgb
+                mask_image = mask_image.permute(0, 2, 3, 1).contiguous()
 
-                # Convert masks to the feature dtype for concatenation
                 if feature_dtype == torch.uint8:
                     mask_feat = (mask_image * 255).to(feature_dtype)
                 else:
                     mask_feat = mask_image.to(feature_dtype)
 
-                # Also keep a float/dtype copy if needed later (not currently used for weights)
                 mask_image = mask_image.to(dtype)
 
-            # Ensure the rgb/features tensor has the same number of channels as `colors`
+            # Build the full feature tensor (B, H, W, 3+N) for integration
             if colors.shape[1] > model.num_channels:
-                mask_ch = colors.shape[1] - model.num_channels
+                mask_ch = colors.shape[1] - model.num_channels   # == mask_channel_count
                 if mask_feat is None:
                     zeros_mask = torch.zeros(
                         (rgb_image.shape[0], rgb_image.shape[1], rgb_image.shape[2], mask_ch),
@@ -683,7 +676,7 @@ def tsdf_from_splats_dlnr(
                     )
                     rgb_for_integration = torch.cat([rgb_image, zeros_mask], dim=-1)
                 else:
-                    # Pad mask_feat if it has fewer channels than reserved
+                    # Pad mask_feat if it has fewer channels than reserved (safety guard)
                     if mask_feat.shape[-1] < mask_ch:
                         pad = torch.zeros(
                             (*mask_feat.shape[:-1], mask_ch - mask_feat.shape[-1]),
@@ -718,29 +711,27 @@ def tsdf_from_splats_dlnr(
             weights = new_grid.inject_from(accum_grid, weights)
             accum_grid = new_grid
 
-            # TSDF fusion is a bit of a torture case for the PyTorch memory allocator since
-            # it progressively allocates bigger tensors which don't fit in the memory pool,
-            # causing the pool to grow larger and larger.
-            # To avoid this, we synchronize the CUDA device and empty the cache after each image.
             del rgb_image, depth_image, weight_image, mask_image
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        # After integrating all the images, we prune the grid to remove empty voxels which have no weights.
-        # This is done to reduce the size of the grid and speed up the marching cubes algorithm
-        # which will be used to extract the mesh.
+        # Final pruning pass
         new_grid = accum_grid.pruned_grid(weights > 0.0)
         filter_tsdf = new_grid.inject_from(accum_grid, tsdf)
         filter_colors = new_grid.inject_from(accum_grid, colors)
-        # If masks were integrated as extra channels, extract them from the feature vector.
+
+        # Extract mask channels from the combined feature tensor.
+        # filter_mask is ALWAYS (V, N) — never squeezed to (V,) — so that
+        # sample_trilinear in mesh_from_splats_dlnr always receives a 2-D tensor
+        # regardless of whether N=1 (single mask) or N>1 (multi-channel mask).
         if mask_channel_count > 0:
-            mask_feats = filter_colors[:, model.num_channels:]
+            mask_feats = filter_colors[:, model.num_channels:]   # (V, N)
             if feature_dtype == torch.uint8:
                 mask_feats = mask_feats.float().div(255.0).to(dtype)
             else:
                 mask_feats = mask_feats.to(dtype)
             filter_mask = mask_feats
         else:
-            filter_mask = torch.zeros((new_grid.num_voxels, 1), device=device, dtype=dtype)
+            filter_mask = None
 
     return new_grid, filter_tsdf, filter_colors, filter_mask

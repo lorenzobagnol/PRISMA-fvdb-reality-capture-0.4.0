@@ -159,6 +159,6 @@ def mesh_from_splats_dlnr(
     mesh_vertices, mesh_faces, _ = accum_grid.marching_cubes(tsdf, 0.0)
     mesh_colors = accum_grid.sample_trilinear(mesh_vertices, colors.to(dtype)) / 255.0
     mesh_colors.clip_(min=0.0, max=1.0)
-    mesh_mask = accum_grid.sample_trilinear(mesh_vertices, mask_volume.to(dtype))
+    mesh_mask = accum_grid.sample_trilinear(mesh_vertices, mask_volume.to(dtype)) if masks is not None else None
 
     return mesh_vertices, mesh_faces, mesh_colors, mesh_mask
