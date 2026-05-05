@@ -458,7 +458,8 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             mask_t = torch.from_numpy(mask)   # (N, H, W)
             return rgb_t, depth_t, weight_t, mask_t
         except (FileNotFoundError, ValueError):
-            return rgb_t, depth_t, weight_t, None
+            # No mask present on disk: return only rgb, depth, and weight
+            return rgb_t, depth_t, weight_t
 
 
 @torch.no_grad()
