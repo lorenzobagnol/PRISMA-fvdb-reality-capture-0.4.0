@@ -30,7 +30,7 @@ def mesh_from_splats_dlnr(
     use_absolute_baseline: bool = False,
     show_progress: bool = True,
     num_workers: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract a triangle mesh from a :class:`fvdb.GaussianSplat3d` using TSDF fusion from depth maps predicted from the Gaussian splat radiance field and the
     `DLNR foundation model <https://openaccess.thecvf.com/content/CVPR2023/papers/Zhao_High-Frequency_Stereo_Matching_Network_CVPR_2023_paper.pdf>`_.
@@ -134,7 +134,7 @@ def mesh_from_splats_dlnr(
     camera_to_world_matrices, projection_matrices, image_sizes = validate_camera_matrices_and_image_sizes(
         camera_to_world_matrices, projection_matrices, image_sizes
     )
-    accum_grid, tsdf, colors, mask_volume = tsdf_from_splats_dlnr(
+    tsdf_result = tsdf_from_splats_dlnr(
         model=model,
         camera_to_world_matrices=camera_to_world_matrices,
         projection_matrices=projection_matrices,
@@ -156,9 +156,17 @@ def mesh_from_splats_dlnr(
         num_workers=num_workers,
     )
 
+    if len(tsdf_result) == 4:
+        accum_grid, tsdf, colors, mask_volume = tsdf_result
+    else:
+        accum_grid, tsdf, colors = tsdf_result
+        mask_volume = None
+
     mesh_vertices, mesh_faces, _ = accum_grid.marching_cubes(tsdf, 0.0)
     mesh_colors = accum_grid.sample_trilinear(mesh_vertices, colors.to(dtype)) / 255.0
     mesh_colors.clip_(min=0.0, max=1.0)
-    mesh_mask = accum_grid.sample_trilinear(mesh_vertices, mask_volume.to(dtype)) if masks is not None else None
 
-    return mesh_vertices, mesh_faces, mesh_colors, mesh_mask
+    if mask_volume is not None:
+        mesh_mask = accum_grid.sample_trilinear(mesh_vertices, mask_volume.to(dtype))
+        return mesh_vertices, mesh_faces, mesh_colors, mesh_mask
+    return mesh_vertices, mesh_faces, mesh_colors

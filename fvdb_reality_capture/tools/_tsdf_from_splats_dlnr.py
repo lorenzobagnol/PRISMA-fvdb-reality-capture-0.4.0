@@ -482,7 +482,7 @@ def tsdf_from_splats_dlnr(
     use_absolute_baseline: bool = False,
     show_progress: bool = True,
     num_workers: int = 8,
-) -> tuple[Grid, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[Grid, torch.Tensor, torch.Tensor] | tuple[Grid, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract a Truncated Signed Distance Field (TSDF) from a `fvdb.GaussianSplat3d` using TSDF fusion from depth maps
     predicted from the Gaussian splat radiance field and the
@@ -734,4 +734,6 @@ def tsdf_from_splats_dlnr(
         else:
             filter_mask = None
 
+    if filter_mask is None:
+        return new_grid, filter_tsdf, filter_colors
     return new_grid, filter_tsdf, filter_colors, filter_mask
