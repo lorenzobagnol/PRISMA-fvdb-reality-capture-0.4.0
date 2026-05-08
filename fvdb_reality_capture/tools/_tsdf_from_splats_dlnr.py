@@ -660,7 +660,7 @@ def tsdf_from_splats_dlnr(
                 mask_image = mask_image.permute(0, 2, 3, 1).contiguous()
 
                 if feature_dtype == torch.uint8:
-                    mask_feat = (mask_image * 255).to(feature_dtype)
+                    mask_feat = (mask_image * 255).clamp(0, 255).to(feature_dtype)
                 else:
                     mask_feat = mask_image.to(feature_dtype)
 
@@ -726,15 +726,14 @@ def tsdf_from_splats_dlnr(
         # sample_trilinear in mesh_from_splats_dlnr always receives a 2-D tensor
         # regardless of whether N=1 (single mask) or N>1 (multi-channel mask).
         if mask_channel_count > 0:
+            filter_rgb = filter_colors[:, :model.num_channels]   # (V, 3)
             mask_feats = filter_colors[:, model.num_channels:]   # (V, N)
             if feature_dtype == torch.uint8:
                 mask_feats = mask_feats.float().div(255.0).to(dtype)
             else:
                 mask_feats = mask_feats.to(dtype)
-            filter_mask = mask_feats
-        else:
-            filter_mask = None
+            # make it binary mask
+            filter_mask = mask_feats > 0.3
+            return new_grid, filter_tsdf, filter_rgb, filter_mask
 
-    if filter_mask is None:
         return new_grid, filter_tsdf, filter_colors
-    return new_grid, filter_tsdf, filter_colors, filter_mask
