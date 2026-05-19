@@ -594,7 +594,7 @@ def tsdf_from_splats_dlnr(
         projection_matrices = projection_matrices.clone()
         projection_matrices[:, :2, :] /= image_downsample_factor
 
-    with tempfile.TemporaryDirectory() as cache_path:
+    with tempfile.TemporaryDirectory(dir="/workspace/tmp") as cache_path:
         dataset = TSDFInputDataset(
             cache_path=pathlib.Path(cache_path),
             model=model,
