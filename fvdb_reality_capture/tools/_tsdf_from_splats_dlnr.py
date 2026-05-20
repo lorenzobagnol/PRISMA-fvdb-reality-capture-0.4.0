@@ -483,6 +483,9 @@ def tsdf_from_splats_dlnr(
     use_absolute_baseline: bool = False,
     show_progress: bool = True,
     num_workers: int = 8,
+    # --- New offloading parameters ---
+    cpu_offload_batch_size: int = 20,   # fuse this many images before offloading to CPU
+    max_gpu_voxels: int = 50_000_000,   # emergency offload if GPU grid exceeds this
 ) -> tuple[Grid, torch.Tensor, torch.Tensor] | tuple[Grid, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract a Truncated Signed Distance Field (TSDF) from a `fvdb.GaussianSplat3d` using TSDF fusion from depth maps
@@ -611,128 +614,183 @@ def tsdf_from_splats_dlnr(
             use_absolute_baseline=use_absolute_baseline,
             show_progress=show_progress,
         )
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
-
+        model_num_channels = model.num_channels
         device = model.device
+        # Free the Gaussian splat model – it's no longer used
+        dataset.model = None
+        torch.cuda.empty_cache()
         voxel_size = truncation_margin / grid_shell_thickness
-        # N mask channels are stored as extra feature channels appended to RGB (3 ch).
-        # mask_channel_count == 0 when masks is None.
         mask_channel_count = masks.shape[1] if masks is not None else 0
-        accum_grid = Grid.from_dense(dense_dims=1, ijk_min=0, voxel_size=voxel_size, origin=0.0, device=device)
-        tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
-        weights = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
-        colors = torch.zeros(
-            (accum_grid.num_voxels, model.num_channels + mask_channel_count),
-            device=device,
-            dtype=feature_dtype,
+
+        # Master grid kept on CPU; moved to GPU only during batch processing
+        cpu_device = torch.device('cpu')
+        accum_grid_cpu = Grid.from_dense(dense_dims=1, ijk_min=0, voxel_size=voxel_size, origin=0.0, device=cpu_device)
+        tsdf_cpu = torch.zeros(accum_grid_cpu.num_voxels, device=cpu_device, dtype=dtype)
+        weights_cpu = torch.zeros(accum_grid_cpu.num_voxels, device=cpu_device, dtype=dtype)
+        colors_cpu = torch.zeros(
+            (accum_grid_cpu.num_voxels, model_num_channels + mask_channel_count),
+            device=cpu_device, dtype=feature_dtype,
         )
 
-        enumerator = tqdm.tqdm(dataloader, unit="imgs", desc="Extracting TSDF") if show_progress else dataloader
+        total = len(dataset)
+        pbar = tqdm.tqdm(total=total, unit="imgs", desc="Extracting TSDF (CPU offload)") if show_progress else None
 
-        for i, tsdf_input in enumerate(enumerator):
-            cam_to_world_matrix = camera_to_world_matrices[i].to(dtype=torch.float32, device=device)
-            projection_matrix = projection_matrices[i].to(dtype=torch.float32, device=device)
+        batch_start = 0
+        while batch_start < total:
+            batch_end = min(batch_start + cpu_offload_batch_size, total)
+            # Move master grid to GPU for this batch
+            accum_grid = accum_grid_cpu.to(device)
+            tsdf = tsdf_cpu.to(device)
+            weights = weights_cpu.to(device)
+            colors = colors_cpu.to(device)
 
-            if len(tsdf_input) == 4:
-                rgb_image, depth_image, weight_image, mask_image = tsdf_input
-            else:
-                rgb_image, depth_image, weight_image = tsdf_input
-                mask_image = None
+            i = batch_start
+            while i < batch_end:
+                # Load single sample directly from dataset (returns tensors on CPU)
+                tsdf_input = dataset[i]
 
-            # Convert rgb image to feature dtype
-            if feature_dtype == torch.uint8:
-                rgb_image = (rgb_image * 255).to(feature_dtype)
-            else:
-                rgb_image = rgb_image.to(feature_dtype)
+                cam_to_world_matrix = camera_to_world_matrices[i].to(dtype=torch.float32, device=device)
+                projection_matrix = projection_matrices[i].to(dtype=torch.float32, device=device)
 
-            # Prepare depth and weight tensors
-            depth_image = depth_image.to(dtype)
-            weight_image = weight_image.to(dtype)
+                # Unpack exactly as original
+                if len(tsdf_input) == 4:
+                    rgb_image, depth_image, weight_image, mask_image = tsdf_input
+                else:
+                    rgb_image, depth_image, weight_image = tsdf_input
+                    mask_image = None
 
-            # Prepare mask feature channels (if provided) in the same feature dtype.
-            # mask_image from __getitem__ is (N, H, W); DataLoader wraps it to (B, N, H, W).
-            mask_feat = None
-            if mask_image is not None:
-                # Normalise to (B, N, H, W) — handle both batched and unbatched cases
-                if mask_image.dim() == 3:
-                    mask_image = mask_image.unsqueeze(0)   # (N, H, W) → (1, N, H, W)
-                # (B, N, H, W) → (B, H, W, N) channel-last for concatenation with rgb
-                mask_image = mask_image.permute(0, 2, 3, 1).contiguous()
+                # Convert numpy arrays to torch tensors if needed (since we bypass DataLoader)
+                if isinstance(rgb_image, np.ndarray):
+                    rgb_image = torch.from_numpy(rgb_image)
+                if isinstance(depth_image, np.ndarray):
+                    depth_image = torch.from_numpy(depth_image)
+                if isinstance(weight_image, np.ndarray):
+                    weight_image = torch.from_numpy(weight_image)
+                if mask_image is not None and isinstance(mask_image, np.ndarray):
+                    mask_image = torch.from_numpy(mask_image)
 
+                # Move images to GPU (they are on CPU from dataset)
+                rgb_image = rgb_image.to(device)
+                depth_image = depth_image.to(device)
+                weight_image = weight_image.to(device)
+                if mask_image is not None:
+                    mask_image = mask_image.to(device)
+
+                # Convert rgb image to feature dtype
                 if feature_dtype == torch.uint8:
-                    mask_feat = (mask_image * 255).clamp(0, 255).to(feature_dtype)
+                    rgb_image = (rgb_image * 255).to(feature_dtype)
                 else:
-                    mask_feat = mask_image.to(feature_dtype)
+                    rgb_image = rgb_image.to(feature_dtype)
 
-                mask_image = mask_image.to(dtype)
+                # Prepare depth and weight tensors
+                depth_image = depth_image.to(dtype)
+                weight_image = weight_image.to(dtype)
 
-            # Build the full feature tensor (B, H, W, 3+N) for integration
-            if colors.shape[1] > model.num_channels:
-                mask_ch = colors.shape[1] - model.num_channels   # == mask_channel_count
-                if mask_feat is None:
-                    zeros_mask = torch.zeros(
-                        (rgb_image.shape[0], rgb_image.shape[1], rgb_image.shape[2], mask_ch),
-                        device=rgb_image.device,
-                        dtype=feature_dtype,
-                    )
-                    rgb_for_integration = torch.cat([rgb_image, zeros_mask], dim=-1)
-                else:
-                    # Pad mask_feat if it has fewer channels than reserved (safety guard)
-                    if mask_feat.shape[-1] < mask_ch:
-                        pad = torch.zeros(
-                            (*mask_feat.shape[:-1], mask_ch - mask_feat.shape[-1]),
-                            device=mask_feat.device,
-                            dtype=feature_dtype,
+                # Prepare mask feature channels (if provided)
+                mask_feat = None
+                if mask_image is not None:
+                    if mask_image.dim() == 3:
+                        mask_image = mask_image.unsqueeze(0)   # (N, H, W) -> (1, N, H, W)
+                    # (B, N, H, W) -> (B, H, W, N) channel-last
+                    mask_image = mask_image.permute(0, 2, 3, 1).contiguous()
+                    if feature_dtype == torch.uint8:
+                        mask_feat = (mask_image * 255).clamp(0, 255).to(feature_dtype)
+                    else:
+                        mask_feat = mask_image.to(feature_dtype)
+                    mask_image = mask_image.to(dtype)
+
+                # Build full feature tensor
+                if colors.shape[1] > model_num_channels:
+                    mask_ch = colors.shape[1] - model_num_channels
+                    if mask_feat is None:
+                        zeros_mask = torch.zeros(
+                            (rgb_image.shape[0], rgb_image.shape[1], rgb_image.shape[2], mask_ch),
+                            device=rgb_image.device, dtype=feature_dtype,
                         )
-                        mask_feat = torch.cat([mask_feat, pad], dim=-1)
-                    rgb_for_integration = torch.cat([rgb_image, mask_feat], dim=-1)
+                        rgb_for_integration = torch.cat([rgb_image, zeros_mask], dim=-1)
+                    else:
+                        if mask_feat.shape[-1] < mask_ch:
+                            pad = torch.zeros(
+                                (*mask_feat.shape[:-1], mask_ch - mask_feat.shape[-1]),
+                                device=mask_feat.device, dtype=feature_dtype,
+                            )
+                            mask_feat = torch.cat([mask_feat, pad], dim=-1)
+                        rgb_for_integration = torch.cat([rgb_image, mask_feat], dim=-1)
+                else:
+                    rgb_for_integration = rgb_image
+
+                # Integrate on GPU
+                accum_grid, tsdf, weights, colors = accum_grid.integrate_tsdf_with_features(
+                    truncation_margin,
+                    projection_matrix.to(dtype),
+                    cam_to_world_matrix.to(dtype),
+                    tsdf,
+                    colors,
+                    weights,
+                    depth_image.squeeze(0).to(device),
+                    rgb_for_integration.squeeze(0).to(device),
+                    weight_image.squeeze(0).to(device),
+                )
+
+                # Prune zero-weight voxels
+                new_grid = accum_grid.pruned_grid(weights > 0.0)
+                tsdf = new_grid.inject_from(accum_grid, tsdf)
+                colors = new_grid.inject_from(accum_grid, colors)
+                weights = new_grid.inject_from(accum_grid, weights)
+                accum_grid = new_grid
+
+                if pbar:
+                    pbar.update(1)
+                    pbar.set_postfix({"voxels": accum_grid.num_voxels})
+
+                # Emergency offload if GPU grid gets too large
+                if accum_grid.num_voxels > max_gpu_voxels:
+                    accum_grid_cpu = accum_grid.to(cpu_device)
+                    tsdf_cpu = tsdf.to(cpu_device)
+                    weights_cpu = weights.to(cpu_device)
+                    colors_cpu = colors.to(cpu_device)
+                    del accum_grid, tsdf, weights, colors, rgb_image, depth_image, weight_image, mask_image
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    batch_start = i + 1
+                    break
+                else:
+                    del rgb_image, depth_image, weight_image, mask_image
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    i += 1
             else:
-                rgb_for_integration = rgb_image
+                # Finished batch normally – move result to CPU
+                accum_grid_cpu = accum_grid.to(cpu_device)
+                tsdf_cpu = tsdf.to(cpu_device)
+                weights_cpu = weights.to(cpu_device)
+                colors_cpu = colors.to(cpu_device)
+                del accum_grid, tsdf, weights, colors
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                batch_start = batch_end
 
-            accum_grid, tsdf, weights, colors = accum_grid.integrate_tsdf_with_features(
-                truncation_margin,
-                projection_matrix.to(dtype),
-                cam_to_world_matrix.to(dtype),
-                tsdf,
-                colors,
-                weights,
-                depth_image.squeeze(0).to(device),
-                rgb_for_integration.squeeze(0).to(device),
-                weight_image.squeeze(0).to(device),
-            )
+        if pbar:
+            pbar.close()
 
-            if show_progress:
-                assert isinstance(enumerator, tqdm.tqdm)
-                enumerator.set_postfix({"accumulated_voxels": accum_grid.num_voxels})
+        # Final pruning on CPU, then move back to GPU for marching cubes
+        new_grid_cpu = accum_grid_cpu.pruned_grid(weights_cpu > 0.0)
+        filter_tsdf_cpu = new_grid_cpu.inject_from(accum_grid_cpu, tsdf_cpu)
+        filter_colors_cpu = new_grid_cpu.inject_from(accum_grid_cpu, colors_cpu)
 
-            # Prune out zero weight voxels to save memory
-            new_grid = accum_grid.pruned_grid(weights > 0.0)
-            tsdf = new_grid.inject_from(accum_grid, tsdf)
-            colors = new_grid.inject_from(accum_grid, colors)
-            weights = new_grid.inject_from(accum_grid, weights)
-            accum_grid = new_grid
+        # Move final result back to original device (needed for marching cubes later)
+        new_grid = new_grid_cpu.to(device)
+        filter_tsdf = filter_tsdf_cpu.to(device)
+        filter_colors = filter_colors_cpu.to(device)
 
-            del rgb_image, depth_image, weight_image, mask_image
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-        # Final pruning pass
-        new_grid = accum_grid.pruned_grid(weights > 0.0)
-        filter_tsdf = new_grid.inject_from(accum_grid, tsdf)
-        filter_colors = new_grid.inject_from(accum_grid, colors)
-
-        # Extract mask channels from the combined feature tensor.
-        # filter_mask is ALWAYS (V, N) — never squeezed to (V,) — so that
-        # sample_trilinear in mesh_from_splats_dlnr always receives a 2-D tensor
-        # regardless of whether N=1 (single mask) or N>1 (multi-channel mask).
+        # --- Mask extraction (unchanged, but use filter_colors on GPU) ---
         if mask_channel_count > 0:
-            filter_rgb = filter_colors[:, :model.num_channels]   # (V, 3)
-            mask_feats = filter_colors[:, model.num_channels:]   # (V, N)
+            filter_rgb = filter_colors[:, :model_num_channels]
+            mask_feats = filter_colors[:, model_num_channels:]
             if feature_dtype == torch.uint8:
                 mask_feats = mask_feats.float().div(255.0).to(dtype)
             else:
                 mask_feats = mask_feats.to(dtype)
-            # make it binary mask
             filter_mask = mask_feats > 0.3
             return new_grid, filter_tsdf, filter_rgb, filter_mask
 
