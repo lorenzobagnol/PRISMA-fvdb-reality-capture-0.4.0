@@ -301,18 +301,19 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
 
         # If you passed in masks, we'll set set these in the data dictionary
         if image_meta.mask_path != "":
-            if image_meta.mask_path.endswith(".jpg") or image_meta.mask_path.endswith(".jpeg"):
-                img_data = torchvision.io.read_file(image_meta.mask_path)
+            mask_path = str(image_meta.mask_path)   # ← convert PosixPath → str
+            if mask_path.endswith(".jpg") or mask_path.endswith(".jpeg"):
+                img_data = torchvision.io.read_file(mask_path)
                 mask = torchvision.io.decode_jpeg(img_data, device="cpu")[0].numpy()
-            elif image_meta.mask_path.endswith(".png"):
-                img_data = torchvision.io.read_file(image_meta.mask_path)
+            elif mask_path.endswith(".png"):
+                img_data = torchvision.io.read_file(mask_path)
                 mask = torchvision.io.decode_png(img_data)[0].numpy()
             else:
-                mask = cv2.imread(image_meta.mask_path, cv2.IMREAD_GRAYSCALE)
-                assert mask is not None, f"Failed to load mask: {image_meta.mask_path}"
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                assert mask is not None, f"Failed to load mask: {mask_path}"
             mask = mask > 127
 
-            data["mask_path"] = image_meta.mask_path
+            data["mask_path"] = mask_path
             data["mask"] = mask
 
         # If you asked to load depths, we'll load the depths of visible colmap points
