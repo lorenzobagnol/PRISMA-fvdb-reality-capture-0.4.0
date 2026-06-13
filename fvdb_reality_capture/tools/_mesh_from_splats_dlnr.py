@@ -31,6 +31,7 @@ def mesh_from_splats_dlnr(
     show_progress: bool = True,
     num_workers: int = 8,
     dlnr_cache_path: str | None = None,
+    fusion_foreground_masks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract a triangle mesh from a :class:`fvdb.GaussianSplat3d` using TSDF fusion from depth maps predicted from the Gaussian splat radiance field and the
@@ -125,6 +126,10 @@ def mesh_from_splats_dlnr(
         dlnr_cache_path (str | None): Optional cache directory for intermediate DLNR TSDF inputs
             (depth, RGB, weights, masks). If ``None``, the default path configured by
             :func:`fvdb_reality_capture.tools.tsdf_from_splats_dlnr` is used.
+        fusion_foreground_masks (torch.Tensor | None): Optional foreground masks for TSDF fusion gating,
+            with shape ``(C, 1, H, W)`` where ``C`` is number of views. Pixels with value 0 are excluded
+            from TSDF integration to reduce background voxel allocation. This is separate from ``masks``
+            (which are integrated as extra mesh feature channels).
 
     Returns:
         mesh_vertices (torch.Tensor): A ``(V, 3)``-shaped tensor of mesh vertices of the extracted mesh.
@@ -156,6 +161,7 @@ def mesh_from_splats_dlnr(
         feature_dtype=feature_dtype,
         dlnr_backbone=dlnr_backbone,
         dlnr_cache_path=dlnr_cache_path,
+        fusion_foreground_masks=fusion_foreground_masks,
         use_absolute_baseline=use_absolute_baseline,
         show_progress=show_progress,
         num_workers=num_workers,
