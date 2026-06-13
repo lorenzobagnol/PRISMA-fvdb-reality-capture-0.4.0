@@ -627,6 +627,8 @@ def tsdf_from_splats_dlnr(
         projection_matrices[:, :2, :] /= image_downsample_factor
 
     cache_path = pathlib.Path(dlnr_cache_path) if dlnr_cache_path is not None else pathlib.Path("/workspace/tsdf_dlnr_cache")
+    
+    print("Generating TSDF inputs with DLNR...")
     dataset = TSDFInputDataset(
         cache_path=cache_path,
         model=model,
@@ -644,6 +646,7 @@ def tsdf_from_splats_dlnr(
         show_progress=show_progress,
         fusion_foreground_masks=fusion_foreground_masks,
     )
+    print("Done generating TSDF inputs.")
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
 
     device = model.device
