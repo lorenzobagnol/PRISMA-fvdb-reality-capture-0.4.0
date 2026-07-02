@@ -6,6 +6,7 @@ import pathlib
 import numpy as np
 import torch
 import tqdm
+from PIL import Image
 from fvdb import GaussianSplat3d, Grid
 from fvdb.types import NumericMaxRank2, NumericMaxRank3
 
@@ -107,7 +108,7 @@ class TSDFInputDataset(torch.utils.data.Dataset):
         use_absolute_baseline: bool,
         show_progress: bool,
         masks: torch.Tensor | None = None,
-        fusion_foreground_masks: torch.Tensor | None = None,
+        fusion_foreground_mask_paths: list[str | None] | None = None,
     ):
         """
         Create a TSDFInputDataset by precomputing and caching the RGB images, depths, and weights for TSDF fusion.
@@ -133,8 +134,8 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             show_progress (bool): Whether to show a progress bar (default is True).
             masks (torch.Tensor | None): An optional (C, N, H, W) tensor of N binary masks per image,
                 where N >= 1. Supports both single-channel (N=1) and multi-channel (N>1) masks.
-            fusion_foreground_masks (torch.Tensor | None): Optional foreground masks for TSDF fusion gating,
-                shape (C, 1, H, W). Zeros suppress TSDF integration in background pixels.
+            fusion_foreground_mask_paths (list[str | None] | None): Optional per-view mask paths used for
+                streaming foreground gating. Each entry is either a mask image path or None.
         """
         if not cache_path.exists():
             cache_path.mkdir(parents=True, exist_ok=True)
@@ -150,7 +151,13 @@ class TSDFInputDataset(torch.utils.data.Dataset):
         self.alpha_threshold = alpha_threshold
         self.dlnr_model = dlnr_model
         self.masks = masks
-        self.fusion_foreground_masks = fusion_foreground_masks
+        self.fusion_foreground_mask_paths = fusion_foreground_mask_paths
+
+        if self.fusion_foreground_mask_paths is not None and len(self.fusion_foreground_mask_paths) != self.num_images:
+            raise ValueError(
+                "fusion_foreground_mask_paths length mismatch: "
+                f"expected {self.num_images}, got {len(self.fusion_foreground_mask_paths)}"
+            )
 
         device = model.device
 
@@ -173,9 +180,7 @@ class TSDFInputDataset(torch.utils.data.Dataset):
                 projection_matrix=projection_matrix,
                 image_width=image_width,
                 image_height=image_height,
-                fusion_foreground_mask=(
-                    self.fusion_foreground_masks[i] if self.fusion_foreground_masks is not None else None
-                ),
+                fusion_foreground_mask=None,
                 save_debug_images_to=None,
             )
 
@@ -473,10 +478,36 @@ class TSDFInputDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_images
 
+    def _load_fusion_foreground_mask_for_idx(self, idx: int, image_height: int, image_width: int) -> torch.Tensor | None:
+        if self.fusion_foreground_mask_paths is None:
+            return None
+
+        mask_path = self.fusion_foreground_mask_paths[idx]
+        if mask_path is None or len(mask_path) == 0:
+            return None
+
+        try:
+            with Image.open(mask_path) as mask_img:
+                mask_arr = np.asarray(mask_img.convert("L"), dtype=np.uint8)
+            if mask_arr.shape != (image_height, image_width):
+                raise ValueError(f"expected {(image_height, image_width)} got {tuple(mask_arr.shape)}")
+            return torch.from_numpy(mask_arr > 127)
+        except Exception as e:
+            print(f"WARNING: Failed to load foreground mask {mask_path}: {e}. Using all pixels for this view.")
+            return None
+
     def __getitem__(self, idx):
         _, rgb_t = self.cache.read_file(f"rgb_{idx}")
         _, depth_t = self.cache.read_file(f"depth_{idx}")
         _, weight_t = self.cache.read_file(f"weight_{idx}")
+
+        if self.fusion_foreground_mask_paths is not None:
+            image_height, image_width = weight_t.shape[-2], weight_t.shape[-1]
+            fusion_foreground_mask = self._load_fusion_foreground_mask_for_idx(idx, image_height, image_width)
+            if fusion_foreground_mask is not None:
+                if not torch.is_tensor(weight_t):
+                    weight_t = torch.from_numpy(weight_t)
+                weight_t = weight_t & fusion_foreground_mask.to(device=weight_t.device)
 
         try:
             _, mask = self.cache.read_file(f"mask_{idx}")
@@ -510,7 +541,7 @@ def tsdf_from_splats_dlnr(
     show_progress: bool = True,
     num_workers: int = 8,
     dlnr_cache_path: str | pathlib.Path | None = None,
-    fusion_foreground_masks: torch.Tensor | None = None,
+    fusion_foreground_mask_paths: list[str | None] | None = None,
 ) -> tuple[Grid, torch.Tensor, torch.Tensor] | tuple[Grid, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract a Truncated Signed Distance Field (TSDF) from a `fvdb.GaussianSplat3d` using TSDF fusion from depth maps
@@ -599,8 +630,8 @@ def tsdf_from_splats_dlnr(
         num_workers (int): Number of workers to use for loading data generated by DLNR. Default is 8.
         dlnr_cache_path (str | pathlib.Path | None): Optional cache directory for intermediate DLNR TSDF
             inputs (depth, RGB, weights, masks). If ``None``, defaults to ``/workspace/tsdf_dlnr_cache``.
-        fusion_foreground_masks (torch.Tensor | None): Optional foreground masks for TSDF fusion gating,
-            shape ``(C, 1, H, W)``. Pixels where mask is 0 are excluded from TSDF integration.
+        fusion_foreground_mask_paths (list[str | None] | None): Optional per-view mask paths for
+            streaming TSDF fusion gating. Each entry is either a mask image path or ``None``.
 
     Returns:
         accum_grid (Grid): The accumulated :class:`fvdb.Grid` representing the voxels in the TSDF volume.
@@ -644,7 +675,7 @@ def tsdf_from_splats_dlnr(
         dlnr_model=DLNRModel(backbone=dlnr_backbone, device=model.device),
         use_absolute_baseline=use_absolute_baseline,
         show_progress=show_progress,
-        fusion_foreground_masks=fusion_foreground_masks,
+        fusion_foreground_mask_paths=fusion_foreground_mask_paths,
     )
     print("Done generating TSDF inputs.")
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
