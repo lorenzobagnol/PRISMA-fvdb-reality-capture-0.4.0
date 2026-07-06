@@ -104,7 +104,7 @@ class TSDFInputDataset(torch.utils.data.Dataset):
         far: float,
         reprojection_threshold: float,
         alpha_threshold: float,
-        dlnr_model: DLNRModel,
+        dlnr_model: DLNRModel | None,
         use_absolute_baseline: bool,
         show_progress: bool,
         masks: torch.Tensor | None = None,
@@ -129,7 +129,8 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             reprojection_threshold (float): Reprojection error threshold for occlusion masking in pixels.
             alpha_threshold (float): Alpha threshold to mask pixels where the Gaussian splat model is transparent
                 (usually indicating the background).
-            dlnr_model (DLNRModel): The DLNR model to compute optical flow and disparity.
+            dlnr_model (DLNRModel | None): The DLNR model to compute optical flow and disparity.
+                May be ``None`` only when all required per-view cache files already exist.
             use_absolute_baseline (bool): If True, use the provided baseline as an absolute distance in world units.
             show_progress (bool): Whether to show a progress bar (default is True).
             masks (torch.Tensor | None): An optional (C, N, H, W) tensor of N binary masks per image,
@@ -167,7 +168,32 @@ class TSDFInputDataset(torch.utils.data.Dataset):
             else range(self.num_images)
         )
 
+        def _cache_has_all_required_for_view(view_idx: int) -> bool:
+            required = [f"rgb_{view_idx}", f"depth_{view_idx}", f"weight_{view_idx}"]
+            if self.masks is not None:
+                required.append(f"mask_{view_idx}")
+
+            for key in required:
+                try:
+                    self.cache.read_file(key)
+                except (FileNotFoundError, ValueError):
+                    return False
+            return True
+
+        reused_count = 0
+        generated_count = 0
+
         for i in enumerator:
+            if _cache_has_all_required_for_view(i):
+                reused_count += 1
+                continue
+
+            if self.dlnr_model is None:
+                raise RuntimeError(
+                    "Missing cached TSDF inputs and DLNR model is not available. "
+                    "Provide dlnr_model or ensure cache contains rgb/depth/weight for all views."
+                )
+
             cam_to_world_matrix = camera_to_world_matrices[i].to(dtype=torch.float32, device=device)
             world_to_cam_matrix = (
                 torch.linalg.inv(cam_to_world_matrix).contiguous().to(dtype=torch.float32, device=device)
@@ -192,6 +218,15 @@ class TSDFInputDataset(torch.utils.data.Dataset):
                 # masks[i] is (N, H, W) — preserve all N channels, including N=1
                 mask_i = self.masks[i].cpu().numpy()   # (N, H, W)
                 self.cache.write_file(f"mask_{i}", mask_i, data_type="npy")
+
+            generated_count += 1
+
+        if reused_count > 0:
+            print(
+                "Reused cached TSDF inputs: "
+                f"{reused_count}/{self.num_images} views "
+                f"(generated {generated_count} missing views)."
+            )
 
     def extract_single_tsdf_input(
         self,
@@ -659,7 +694,30 @@ def tsdf_from_splats_dlnr(
 
     cache_path = pathlib.Path(dlnr_cache_path) if dlnr_cache_path is not None else pathlib.Path("/workspace/tsdf_dlnr_cache")
     
-    print("Generating TSDF inputs with DLNR...")
+    cache = SfmCache.get_cache(cache_path, "TSDFInputs", "Cache for TSDF inputs")
+
+    def _cache_has_all_required_inputs() -> bool:
+        required_suffixes = ["rgb", "depth", "weight"]
+        if masks is not None:
+            required_suffixes.append("mask")
+
+        num_views = int(camera_to_world_matrices.shape[0])
+        for i in range(num_views):
+            for suffix in required_suffixes:
+                try:
+                    cache.read_file(f"{suffix}_{i}")
+                except (FileNotFoundError, ValueError):
+                    return False
+        return True
+
+    cache_complete = _cache_has_all_required_inputs()
+    if cache_complete:
+        print(f"Reusing complete TSDF DLNR cache from {cache_path}.")
+        dlnr_model = None
+    else:
+        print("Generating TSDF inputs with DLNR...")
+        dlnr_model = DLNRModel(backbone=dlnr_backbone, device=model.device)
+
     dataset = TSDFInputDataset(
         cache_path=cache_path,
         model=model,
@@ -672,12 +730,12 @@ def tsdf_from_splats_dlnr(
         far=far,
         reprojection_threshold=disparity_reprojection_threshold,
         alpha_threshold=alpha_threshold,
-        dlnr_model=DLNRModel(backbone=dlnr_backbone, device=model.device),
+        dlnr_model=dlnr_model,
         use_absolute_baseline=use_absolute_baseline,
         show_progress=show_progress,
         fusion_foreground_mask_paths=fusion_foreground_mask_paths,
     )
-    print("Done generating TSDF inputs.")
+    print("Done preparing TSDF inputs.")
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
 
     device = model.device
